@@ -32,7 +32,20 @@ define('ITEMS_PER_PAGE', (int)Config::get('ITEMS_PER_PAGE', 5));
 // -------------------------------------------------------
 
 // ==============================
-// TEMPORARY MAINTENANCE MODE - NOW FROM ENV
+// FILE UPLOAD BOT CONFIGURATION
+// ==============================
+define('MAX_FILE_SIZE', 2 * 1024 * 1024 * 1024);  // 2GB for normal Telegram users
+define('FOUR_GB', 4 * 1024 * 1024 * 1024);
+define('CHUNK_SIZE', 64 * 1024);
+define('DEFAULT_WATERMARK', "@EntertainmentTadka786");
+define('HARDCODED_THUMBNAIL', "thumb.png");
+define('METADATA_FILE', "metadata.json");
+define('RETRY_COUNT', 3);
+define('VIDEO_WIDTH', 1280);
+define('VIDEO_HEIGHT', 720);
+
+// ==============================
+// TEMPORARY MAINTENANCE MODE
 // ==============================
 if (MAINTENANCE_MODE) {
     $update = json_decode(file_get_contents('php://input'), true);
@@ -76,6 +89,312 @@ if (!file_exists(BACKUP_DIR)) {
 $movie_messages = array();
 $movie_cache = array();
 $waiting_users = array();
+
+// File Upload Bot State
+$file_bot_state = [
+    'metadata' => [],
+    'thumb_mode' => 'preview',
+    'thumb_opacity' => 70,
+    'thumb_textsize' => 18,
+    'thumb_position' => 'top-right',
+    'split' => false,
+    'new_name' => null,
+    'custom_thumb' => null
+];
+
+$file_queue = [];
+$queue_processing = false;
+
+// ==============================
+// FILE UPLOAD BOT FUNCTIONS
+// ==============================
+function human_readable_size($size, $suffix = "B") {
+    $units = ["", "K", "M", "G", "T"];
+    foreach ($units as $u) {
+        if ($size < 1024) {
+            return sprintf("%.2f%s%s", $size, $u, $suffix);
+        }
+        $size /= 1024;
+    }
+    return sprintf("%.2fP%s", $size, $suffix);
+}
+
+function is_video_file($filename) {
+    $video_ext = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ogg', '.mpeg', '.mpg', '.ts', '.vob', '.m4v'];
+    $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    return in_array('.' . $ext, $video_ext);
+}
+
+function calc_checksum($file_path) {
+    $md5 = md5_file($file_path);
+    $sha1 = sha1_file($file_path);
+    return [$md5, $sha1];
+}
+
+function split_file($source_path, $dest_dir, $part_size = null) {
+    if ($part_size === null) {
+        $part_size = MAX_FILE_SIZE;
+    }
+    
+    $parts = [];
+    $total = filesize($source_path);
+    $num_parts = ceil($total / $part_size);
+    
+    $source_handle = fopen($source_path, "rb");
+    if (!$source_handle) {
+        throw new Exception("Cannot open source file: $source_path");
+    }
+    
+    for ($idx = 0; $idx < $num_parts; $idx++) {
+        $part_name = $dest_dir . "/" . basename($source_path) . ".part" . sprintf("%03d", $idx + 1);
+        $parts[] = $part_name;
+        
+        $part_handle = fopen($part_name, "wb");
+        if (!$part_handle) {
+            fclose($source_handle);
+            throw new Exception("Cannot create part file: $part_name");
+        }
+        
+        $remaining = $part_size;
+        while ($remaining > 0) {
+            $chunk_size = min(CHUNK_SIZE, $remaining);
+            $chunk = fread($source_handle, $chunk_size);
+            if ($chunk === false || strlen($chunk) === 0) {
+                break;
+            }
+            fwrite($part_handle, $chunk);
+            $remaining -= strlen($chunk);
+        }
+        fclose($part_handle);
+    }
+    
+    fclose($source_handle);
+    return $parts;
+}
+
+function resize_video($input_path, $output_path) {
+    try {
+        // Just copy the original video without resizing
+        if (!copy($input_path, $output_path)) {
+            throw new Exception("Copy failed");
+        }
+        return true;
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+function create_watermark_thumb($video_path, $tmp_dir, $opacity = 70, $text_size = 18, $position = "top-right") {
+    try {
+        // HIGH QUALITY FFmpeg thumbnail extraction
+        $thumb_path = $tmp_dir . "/" . pathinfo($video_path, PATHINFO_FILENAME) . "_thumb.jpg";
+        
+        $cmd = [
+            "ffmpeg", "-y",
+            "-i", $video_path,
+            "-ss", "00:00:05",
+            "-vframes", "1",
+            "-q:v", "1",
+            "-vf", "scale=430:241:flags=lanczos",
+            $thumb_path
+        ];
+        
+        $result = shell_exec(implode(" ", $cmd) . " 2>&1");
+        
+        if (!file_exists($thumb_path)) {
+            return null;
+        }
+        
+        // HIGH QUALITY Watermark add karo using GD
+        $img = imagecreatefromjpeg($thumb_path);
+        if (!$img) {
+            return null;
+        }
+        
+        // Ensure exact dimensions
+        $current_width = imagesx($img);
+        $current_height = imagesy($img);
+        
+        if ($current_width != VIDEO_WIDTH || $current_height != VIDEO_HEIGHT) {
+            $resized = imagecreatetruecolor(VIDEO_WIDTH, VIDEO_HEIGHT);
+            imagecopyresampled($resized, $img, 0, 0, 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT, $current_width, $current_height);
+            imagedestroy($img);
+            $img = $resized;
+        }
+        
+        // Create transparent layer for text
+        $txt = imagecreatetruecolor(VIDEO_WIDTH, VIDEO_HEIGHT);
+        imagesavealpha($txt, true);
+        $transparent = imagecolorallocatealpha($txt, 0, 0, 0, 127);
+        imagefill($txt, 0, 0, $transparent);
+        
+        // Font loading
+        $font_paths = [
+            "arialbd.ttf", "arial.ttf", 
+            "C:/Windows/Fonts/arialbd.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        ];
+        
+        $font = null;
+        foreach ($font_paths as $font_path) {
+            if (file_exists($font_path)) {
+                $font = $font_path;
+                break;
+            }
+        }
+        
+        // Calculate text position
+        $bbox = imagettfbbox($text_size, 0, $font, DEFAULT_WATERMARK);
+        $tw = $bbox[2] - $bbox[0];
+        $th = $bbox[3] - $bbox[1];
+        $margin = 10;
+        
+        if ($position == "top-left") {
+            $x = $margin;
+            $y = $margin + $th;
+        } elseif ($position == "top-right") {
+            $x = VIDEO_WIDTH - $tw - $margin;
+            $y = $margin + $th;
+        } elseif ($position == "bottom-left") {
+            $x = $margin;
+            $y = VIDEO_HEIGHT - $margin;
+        } else {
+            $x = VIDEO_WIDTH - $tw - $margin;
+            $y = VIDEO_HEIGHT - $margin;
+        }
+        
+        // Add text with shadow for better visibility
+        $shadow_color = imagecolorallocatealpha($txt, 0, 0, 0, (int)(127 * $opacity / 100));
+        $text_color = imagecolorallocatealpha($txt, 255, 255, 255, (int)(127 * $opacity / 100));
+        
+        imagettftext($txt, $text_size, 0, $x+1, $y+1, $shadow_color, $font, DEFAULT_WATERMARK);
+        imagettftext($txt, $text_size, 0, $x, $y, $text_color, $font, DEFAULT_WATERMARK);
+        
+        // Merge images
+        imagecopy($img, $txt, 0, 0, 0, 0, VIDEO_WIDTH, VIDEO_HEIGHT);
+        
+        // HIGH QUALITY Save (NO COMPRESSION)
+        imagejpeg($img, $thumb_path, 95);
+        
+        // Clean up
+        imagedestroy($img);
+        imagedestroy($txt);
+        
+        return $thumb_path;
+        
+    } catch (Exception $e) {
+        return null;
+    }
+}
+
+function download_telegram_file($file_id, $destination) {
+    global $BOT_TOKEN;
+    $url = "https://api.telegram.org/bot{$BOT_TOKEN}/getFile?file_id=$file_id";
+    $response = json_decode(file_get_contents($url), true);
+    
+    if (!$response || !$response['ok']) {
+        throw new Exception("Cannot get file path");
+    }
+    
+    $file_path = $response['result']['file_path'];
+    $download_url = "https://api.telegram.org/file/bot{$BOT_TOKEN}/$file_path";
+    
+    $file_content = file_get_contents($download_url);
+    if ($file_content === false) {
+        throw new Exception("Cannot download file");
+    }
+    
+    file_put_contents($destination, $file_content);
+}
+
+function send_telegram_video($video_path, $caption, $thumb_path = null, $duration = 0, $chat_id = null) {
+    if ($chat_id === null) {
+        $chat_id = OWNER_ID;
+    }
+    
+    $url = "https://api.telegram.org/bot" . BOT_TOKEN . "/sendVideo";
+    
+    $post_data = [
+        'chat_id' => $chat_id,
+        'caption' => $caption,
+        'duration' => $duration,
+        'width' => VIDEO_WIDTH,
+        'height' => VIDEO_HEIGHT,
+        'supports_streaming' => true,
+        'video' => new CURLFile(realpath($video_path))
+    ];
+    
+    if ($thumb_path && file_exists($thumb_path)) {
+        $post_data['thumb'] = new CURLFile(realpath($thumb_path));
+    }
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    
+    $result = curl_exec($ch);
+    curl_close($ch);
+    
+    return $result;
+}
+
+function send_telegram_document($document_path, $caption, $thumb_path = null, $chat_id = null) {
+    if ($chat_id === null) {
+        $chat_id = OWNER_ID;
+    }
+    
+    $url = "https://api.telegram.org/bot" . BOT_TOKEN . "/sendDocument";
+    
+    $post_data = [
+        'chat_id' => $chat_id,
+        'caption' => $caption,
+        'document' => new CURLFile(realpath($document_path))
+    ];
+    
+    if ($thumb_path && file_exists($thumb_path)) {
+        $post_data['thumb'] = new CURLFile(realpath($thumb_path));
+    }
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    
+    $result = curl_exec($ch);
+    curl_close($ch);
+    
+    return $result;
+}
+
+function send_telegram_photo($photo_path, $caption, $chat_id = null) {
+    if ($chat_id === null) {
+        $chat_id = OWNER_ID;
+    }
+    
+    $url = "https://api.telegram.org/bot" . BOT_TOKEN . "/sendPhoto";
+    
+    $post_data = [
+        'chat_id' => $chat_id,
+        'caption' => $caption,
+        'photo' => new CURLFile(realpath($photo_path))
+    ];
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $post_data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    
+    $result = curl_exec($ch);
+    curl_close($ch);
+    
+    return $result;
+}
 
 // ==============================
 // Stats
@@ -614,6 +933,541 @@ function admin_stats($chat_id) {
 }
 
 // ==============================
+// FILE UPLOAD BOT COMMAND HANDLERS
+// ==============================
+function handle_file_upload_commands($message) {
+    global $file_bot_state;
+    
+    $user_id = $message['from']['id'];
+    $text = $message['text'] ?? '';
+    
+    // Check if user is owner
+    if ($user_id != OWNER_ID) {
+        sendMessage($user_id, "❌ Access denied. You are not authorized to use file upload features.");
+        return;
+    }
+    
+    $command = explode(' ', $text)[0];
+    
+    switch ($command) {
+        case '/upload_help':
+            handle_upload_help($message);
+            break;
+            
+        case '/setname':
+            handle_set_name($message);
+            break;
+            
+        case '/clearname':
+            handle_clear_name($message);
+            break;
+            
+        case '/split_on':
+            handle_split_on($message);
+            break;
+            
+        case '/split_off':
+            handle_split_off($message);
+            break;
+            
+        case '/upload_status':
+            handle_upload_status($message);
+            break;
+            
+        case '/metadata':
+            handle_metadata($message);
+            break;
+            
+        case '/setthumb':
+            handle_set_thumbnail($message);
+            break;
+            
+        case '/view_thumb':
+            handle_view_thumbnail($message);
+            break;
+            
+        case '/del_thumb':
+            handle_delete_thumbnail($message);
+            break;
+            
+        default:
+            // Check if it's a file for upload
+            if (isset($message['document']) || isset($message['video']) || isset($message['audio'])) {
+                handle_file_upload($message);
+            }
+            break;
+    }
+}
+
+function handle_upload_help($message) {
+    global $file_bot_state;
+    
+    $thumb_status = file_exists(HARDCODED_THUMBNAIL) ? "✅ EXISTS" : "❌ NOT FOUND";
+    $custom_thumb_status = isset($file_bot_state["custom_thumb"]) && $file_bot_state["custom_thumb"] ? "✅ SET" : "❌ NOT SET";
+    
+    $help_text = "**📁 File Upload Bot v8.2**\n\n"
+        . "**FIXED: HIGH QUALITY THUMBNAILS (NO BLUR)**\n\n"
+        . "**Commands:**\n"
+        . "• `/setname <filename.ext>` - Set new filename\n"
+        . "• `/clearname` - Clear set filename\n"
+        . "• `/split_on` - Enable 4GB split\n"
+        . "• `/split_off` - Disable 4GB split\n"
+        . "• `/upload_status` - Show current settings\n"
+        . "• `/metadata key=value` - Set custom metadata\n"
+        . "• `/setthumb` - Set custom thumbnail\n"
+        . "• `/view_thumb` - View current thumbnail\n"
+        . "• `/del_thumb` - Delete custom thumbnail\n\n"
+        . "**Video & Thumbnail Dimensions:** " . VIDEO_WIDTH . "x" . VIDEO_HEIGHT . "\n"
+        . "**Max File Size:** 4GB (Telegram)\n"
+        . "**Default Thumb:** $thumb_status\n"
+        . "**Custom Thumb:** $custom_thumb_status\n"
+        . "**Thumbnail Quality:** HIGH (No Blur)";
+        
+    sendMessage($message['chat']['id'], $help_text, null, 'HTML');
+}
+
+function handle_set_name($message) {
+    global $file_bot_state;
+    
+    $args = explode(' ', $message['text'], 2);
+    if (count($args) < 2) {
+        sendMessage($message['chat']['id'], "❌ Usage: `/setname <filename.ext>`", null, 'HTML');
+        return;
+    }
+    
+    $file_bot_state["new_name"] = trim($args[1]);
+    sendMessage($message['chat']['id'], "✅ Name set: `{$args[1]}`", null, 'HTML');
+}
+
+function handle_clear_name($message) {
+    global $file_bot_state;
+    
+    $file_bot_state["new_name"] = null;
+    sendMessage($message['chat']['id'], "✅ Name cleared.");
+}
+
+function handle_split_on($message) {
+    global $file_bot_state;
+    
+    $file_bot_state["split"] = true;
+    sendMessage($message['chat']['id'], "✅ 4GB split ENABLED");
+}
+
+function handle_split_off($message) {
+    global $file_bot_state;
+    
+    $file_bot_state["split"] = false;
+    sendMessage($message['chat']['id'], "✅ 4GB split DISABLED");
+}
+
+function handle_upload_status($message) {
+    global $file_bot_state;
+    
+    $name = $file_bot_state["new_name"] ?? "❌ Not set";
+    $split = isset($file_bot_state["split"]) && $file_bot_state["split"] ? "✅ ON" : "❌ OFF";
+    $thumb = isset($file_bot_state["custom_thumb"]) && $file_bot_state["custom_thumb"] ? "✅ SET" : "❌ NOT SET";
+    $md = $file_bot_state["metadata"] ?? [];
+    
+    $md_text = "";
+    foreach ($md as $k => $v) {
+        $md_text .= "\n• $k: `$v`";
+    }
+    $md_text = $md_text ?: "None";
+    
+    $status_text = "**🤖 File Upload Status**\n\n"
+        . "• **Filename:** `$name`\n"
+        . "• **2GB Split:** $split\n"
+        . "• **Video & Thumbnail Dimensions:** " . VIDEO_WIDTH . "x" . VIDEO_HEIGHT . "\n"
+        . "• **Custom Thumb:** $thumb\n"
+        . "• **Thumbnail Quality:** HIGH (No Blur)\n\n"
+        . "**Metadata:**\n$md_text";
+        
+    sendMessage($message['chat']['id'], $status_text, null, 'HTML');
+}
+
+function handle_metadata($message) {
+    global $file_bot_state;
+    
+    $args = explode(' ', $message['text'], 2);
+    if (count($args) < 2) {
+        sendMessage($message['chat']['id'], "❌ Usage: `/metadata key=value`\n\nExample: `/metadata title=Movie quality=1080p year=2024`", null, 'HTML');
+        return;
+    }
+    
+    if (!isset($file_bot_state["metadata"])) {
+        $file_bot_state["metadata"] = [];
+    }
+    
+    $pairs = explode(' ', $args[1]);
+    $changes = [];
+    
+    foreach ($pairs as $pair) {
+        if (strpos($pair, '=') !== false) {
+            list($k, $v) = explode('=', $pair, 2);
+            $k = trim(strtolower($k));
+            $v = trim($v);
+            $file_bot_state["metadata"][$k] = $v;
+            $changes[] = "• `$k` = `$v`";
+        }
+    }
+    
+    if ($changes) {
+        sendMessage($message['chat']['id'], "✅ Metadata Updated\n" . implode("\n", $changes), null, 'HTML');
+    } else {
+        sendMessage($message['chat']['id'], "❌ No valid key=value pairs found!", null, 'HTML');
+    }
+}
+
+function handle_set_thumbnail($message) {
+    global $file_bot_state;
+    
+    try {
+        $thumb_path = "custom_thumb.jpg";
+        
+        // Check if message has photo or document
+        if (isset($message['photo'])) {
+            $photo = end($message['photo']);
+            $file_id = $photo['file_id'];
+            download_telegram_file($file_id, $thumb_path);
+        } elseif (isset($message['document']) && strpos($message['document']['mime_type'], 'image/') === 0) {
+            $file_id = $message['document']['file_id'];
+            download_telegram_file($file_id, $thumb_path);
+        } else {
+            sendMessage($message['chat']['id'], "❌ Send a photo or image file with `/setthumb`", null, 'HTML');
+            return;
+        }
+        
+        // HIGH QUALITY Resize to VIDEO DIMENSIONS
+        $img = imagecreatefromstring(file_get_contents($thumb_path));
+        if (!$img) {
+            throw new Exception("Cannot process image");
+        }
+        
+        $target_width = VIDEO_WIDTH;
+        $target_height = VIDEO_HEIGHT;
+        
+        $orig_width = imagesx($img);
+        $orig_height = imagesy($img);
+        $img_ratio = $orig_width / $orig_height;
+        $target_ratio = $target_width / $target_height;
+        
+        if ($img_ratio > $target_ratio) {
+            // Image is wider - crop width
+            $new_height = $target_height;
+            $new_width = (int)($target_height * $img_ratio);
+            $resized = imagecreatetruecolor($new_width, $new_height);
+            imagecopyresampled($resized, $img, 0, 0, 0, 0, $new_width, $new_height, $orig_width, $orig_height);
+            
+            // Crop width to target
+            $left = (int)(($new_width - $target_width) / 2);
+            $cropped = imagecreatetruecolor($target_width, $target_height);
+            imagecopy($cropped, $resized, 0, 0, $left, 0, $target_width, $target_height);
+            
+            imagedestroy($resized);
+            imagedestroy($img);
+            $img = $cropped;
+        } else {
+            // Image is taller - crop height
+            $new_width = $target_width;
+            $new_height = (int)($target_width / $img_ratio);
+            $resized = imagecreatetruecolor($new_width, $new_height);
+            imagecopyresampled($resized, $img, 0, 0, 0, 0, $new_width, $new_height, $orig_width, $orig_height);
+            
+            // Crop height to target
+            $top = (int)(($new_height - $target_height) / 2);
+            $cropped = imagecreatetruecolor($target_width, $target_height);
+            imagecopy($cropped, $resized, 0, 0, 0, $top, $target_width, $target_height);
+            
+            imagedestroy($resized);
+            imagedestroy($img);
+            $img = $cropped;
+        }
+        
+        // HIGH QUALITY Save (NO COMPRESSION)
+        imagejpeg($img, $thumb_path, 95);
+        imagedestroy($img);
+        
+        $file_bot_state["custom_thumb"] = $thumb_path;
+        
+        $size = getimagesize($thumb_path);
+        sendMessage(
+            $message['chat']['id'],
+            "✅ HIGH QUALITY Custom thumbnail set!\nSize: {$size[0]}×{$size[1]}\nQuality: 95% (No Blur)\n\n**Video & Thumbnail same dimensions: " . VIDEO_WIDTH . "x" . VIDEO_HEIGHT . "**", 
+            null, 'HTML'
+        );
+        
+    } catch (Exception $e) {
+        sendMessage($message['chat']['id'], "❌ Error setting thumbnail: `{$e->getMessage()}`", null, 'HTML');
+    }
+}
+
+function handle_view_thumbnail($message) {
+    global $file_bot_state;
+    
+    $custom_thumb_path = $file_bot_state["custom_thumb"] ?? null;
+    
+    if (!$custom_thumb_path || !file_exists($custom_thumb_path)) {
+        sendMessage($message['chat']['id'], "❌ No custom thumbnail set!", null, 'HTML');
+        return;
+    }
+    
+    $size = filesize($custom_thumb_path);
+    $img_info = getimagesize($custom_thumb_path);
+    $dimensions = "{$img_info[0]}×{$img_info[1]}";
+    
+    send_telegram_photo(
+        $custom_thumb_path,
+        "**📷 HIGH QUALITY Custom Thumbnail**\nSize: " . human_readable_size($size) . "\nDimensions: $dimensions\nQuality: 95% (No Blur)\n\n**Video & Thumbnail same dimensions: " . VIDEO_WIDTH . "x" . VIDEO_HEIGHT . "**",
+        $message['chat']['id']
+    );
+}
+
+function handle_delete_thumbnail($message) {
+    global $file_bot_state;
+    
+    $custom_thumb_path = $file_bot_state["custom_thumb"] ?? null;
+    
+    if (!$custom_thumb_path) {
+        sendMessage($message['chat']['id'], "❌ No custom thumbnail to delete!", null, 'HTML');
+        return;
+    }
+    
+    try {
+        if (file_exists($custom_thumb_path)) {
+            unlink($custom_thumb_path);
+        }
+        $file_bot_state["custom_thumb"] = null;
+        sendMessage($message['chat']['id'], "✅ Custom thumbnail deleted!");
+    } catch (Exception $e) {
+        sendMessage($message['chat']['id'], "❌ Error deleting thumbnail: `{$e->getMessage()}`", null, 'HTML');
+    }
+}
+
+// ==============================
+// FILE UPLOAD PROCESSING
+// ==============================
+function handle_file_upload($message) {
+    global $file_queue, $queue_processing;
+    
+    $file_queue[] = $message;
+    process_upload_queue();
+}
+
+function process_upload_queue() {
+    global $file_queue, $queue_processing;
+    
+    if ($queue_processing || empty($file_queue)) {
+        return;
+    }
+    
+    $queue_processing = true;
+    
+    while (!empty($file_queue)) {
+        $message = array_shift($file_queue);
+        process_single_file($message);
+    }
+    
+    $queue_processing = false;
+}
+
+function process_single_file($message) {
+    global $file_bot_state;
+    
+    $tmp_dir = sys_get_temp_dir() . "/rename_bot_" . uniqid();
+    mkdir($tmp_dir, 0755, true);
+    
+    $new_name = $file_bot_state["new_name"] ?? null;
+    $do_split = $file_bot_state["split"] ?? false;
+    $metadata = $file_bot_state["metadata"] ?? [];
+    $custom_thumb_path = $file_bot_state["custom_thumb"] ?? null;
+    
+    try {
+        // Get original file name
+        if (isset($message['document'])) {
+            $orig_name = $message['document']['file_name'] ?? 'file';
+            $file_id = $message['document']['file_id'];
+        } elseif (isset($message['video'])) {
+            $orig_name = $message['video']['file_name'] ?? 'video.mp4';
+            $file_id = $message['video']['file_id'];
+        } elseif (isset($message['audio'])) {
+            $orig_name = $message['audio']['file_name'] ?? 'audio';
+            $file_id = $message['audio']['file_id'];
+        } else {
+            throw new Exception("Unsupported file type");
+        }
+        
+        $download_path = $tmp_dir . "/" . $orig_name;
+        sendMessage($message['chat']['id'], "📥 Downloading `$orig_name`\n`[0%]`", null, 'HTML');
+        
+        // Download file
+        download_telegram_file($file_id, $download_path);
+        
+        // Rename if new name is set
+        if ($new_name) {
+            $target_path = $tmp_dir . "/" . $new_name;
+            rename($download_path, $target_path);
+            $file_to_process = $target_path;
+        } else {
+            $file_to_process = $download_path;
+        }
+
+        // Split if enabled and file > Telegram max limit
+        $files_to_upload = [$file_to_process];
+        if ($do_split && filesize($file_to_process) > MAX_FILE_SIZE) {
+            sendMessage($message['chat']['id'], "🔪 Splitting file >2GB for Telegram...", null, 'HTML');
+            $files_to_upload = split_file($file_to_process, $tmp_dir, MAX_FILE_SIZE);
+        }
+
+        $total_parts = count($files_to_upload);
+        
+        // Process each file/part
+        foreach ($files_to_upload as $idx => $p) {
+            $part_num = $idx + 1;
+            $thumb_path = null;
+            $caption = "";
+            $duration = 0;
+            $is_video = is_video_file($p);
+            $final_video_path = $p;  // Default to original file
+            
+            if ($is_video) {
+                // Get video info using ffprobe
+                $ffprobe_cmd = "ffprobe -v quiet -print_format json -show_format -show_streams \"$p\"";
+                $ffprobe_output = shell_exec($ffprobe_cmd);
+                $video_info = json_decode($ffprobe_output, true);
+                
+                if ($video_info && isset($video_info['streams'])) {
+                    foreach ($video_info['streams'] as $stream) {
+                        if ($stream['codec_type'] == 'video') {
+                            $duration = (int)($video_info['format']['duration'] ?? 0);
+                            break;
+                        }
+                    }
+                }
+                
+                // Process video
+                sendMessage($message['chat']['id'], "🔄 Processing video...", null, 'HTML');
+                $resized_path = $tmp_dir . "/" . pathinfo($p, PATHINFO_FILENAME) . "_resized.mp4";
+                
+                if (resize_video($p, $resized_path)) {
+                    $final_video_path = $resized_path;
+                } else {
+                    $final_video_path = $p;
+                }
+                
+                // Create HIGH QUALITY thumbnail with same dimensions
+                $thumb_path = create_watermark_thumb(
+                    $final_video_path, $tmp_dir,
+                    $file_bot_state["thumb_opacity"],
+                    $file_bot_state["thumb_textsize"], 
+                    $file_bot_state["thumb_position"]
+                );
+                
+                $caption = "**" . basename($p) . "**\n**Size:** " . human_readable_size(filesize($p)) . "\n**Duration:** {$duration}s\n**Dimensions:** " . VIDEO_WIDTH . "x" . VIDEO_HEIGHT;
+                
+            } else {
+                $caption = "**" . basename($p) . "**\n**Size:** " . human_readable_size(filesize($p));
+            }
+            
+            // Add metadata to caption
+            if ($metadata) {
+                $caption .= "\n\n**Metadata:**";
+                foreach ($metadata as $k => $v) {
+                    $caption .= "\n• **" . ucfirst($k) . ":** `$v`";
+                }
+            }
+            
+            // Add checksum to caption
+            list($md5, $sha1) = calc_checksum($p);
+            $caption .= "\n\n**Checksum:**\n**MD5:** `$md5`\n**SHA1:** `$sha1`";
+            
+            if ($total_parts > 1) {
+                $caption .= "\n**Part:** $part_num/$total_parts";
+            }
+
+            // Upload with retry
+            for ($attempt = 1; $attempt <= RETRY_COUNT; $attempt++) {
+                try {
+                    sendMessage($message['chat']['id'], "📤 Uploading `" . basename($p) . "` ($part_num/$total_parts)\nAttempt $attempt\n`[0%]`", null, 'HTML');
+                    
+                    // Use custom thumbnail if available
+                    $final_thumb = null;
+                    if ($custom_thumb_path && file_exists($custom_thumb_path)) {
+                        $final_thumb = $custom_thumb_path;
+                    } elseif ($thumb_path && file_exists($thumb_path)) {
+                        $final_thumb = $thumb_path;
+                    }
+                    
+                    if ($is_video) {
+                        $result = send_telegram_video($final_video_path, $caption, $final_thumb, $duration);
+                    } else {
+                        $result = send_telegram_document($p, $caption, $final_thumb);
+                    }
+                    
+                    // Check if upload was successful
+                    $result_data = json_decode($result, true);
+                    if ($result_data && $result_data['ok']) {
+                        break;
+                    } else {
+                        throw new Exception("Upload failed: " . ($result_data['description'] ?? 'Unknown error'));
+                    }
+                    
+                } catch (Exception $e) {
+                    if ($attempt == RETRY_COUNT) {
+                        sendMessage($message['chat']['id'], "❌ Upload Failed after " . RETRY_COUNT . " attempts:\n`{$e->getMessage()}`", null, 'HTML');
+                    } else {
+                        sendMessage($message['chat']['id'], "⚠️ Retrying ($attempt/" . RETRY_COUNT . ")", null, 'HTML');
+                        sleep(2);  // Wait before retry
+                    }
+                }
+            }
+
+            // Cleanup uploaded file and temp files
+            try {
+                if (file_exists($p)) {
+                    unlink($p);
+                }
+                if (isset($resized_path) && file_exists($resized_path)) {
+                    unlink($resized_path);
+                }
+                if ($thumb_path && file_exists($thumb_path)) {
+                    unlink($thumb_path);
+                }
+            } catch (Exception $e) {
+                // Ignore cleanup errors
+            }
+        }
+
+        sendMessage($message['chat']['id'], "✅ Processing Complete!\nAll files uploaded successfully.\nTemp files cleaned.", null, 'HTML');
+        
+    } catch (Exception $e) {
+        sendMessage($message['chat']['id'], "❌ Error\n`{$e->getMessage()}`", null, 'HTML');
+    } finally {
+        // Cleanup temp directory
+        try {
+            rrmdir($tmp_dir);
+        } catch (Exception $e) {
+            // Ignore cleanup errors
+        }
+    }
+}
+
+function rrmdir($dir) {
+    if (is_dir($dir)) {
+        $objects = scandir($dir);
+        foreach ($objects as $object) {
+            if ($object != "." && $object != "..") {
+                if (is_dir($dir . "/" . $object)) {
+                    rrmdir($dir . "/" . $object);
+                } else {
+                    unlink($dir . "/" . $object);
+                }
+            }
+        }
+        rmdir($dir);
+    }
+}
+
+// ==============================
 // Show CSV Data
 // ==============================
 function show_csv_data($chat_id, $show_all = false) {
@@ -891,7 +1745,13 @@ if ($update) {
         if (strpos($text, '/') === 0) {
             $parts = explode(' ', $text);
             $command = $parts[0];
-            if ($command == '/checkdate') check_date($chat_id);
+            
+            // Check if it's a file upload command
+            if (in_array($command, ['/upload_help', '/setname', '/clearname', '/split_on', '/split_off', '/upload_status', '/metadata', '/setthumb', '/view_thumb', '/del_thumb'])) {
+                handle_file_upload_commands($message);
+            }
+            // Original movie bot commands
+            elseif ($command == '/checkdate') check_date($chat_id);
             elseif ($command == '/totalupload' || $command == '/totaluploads' || $command == '/TOTALUPLOAD') totalupload_controller($chat_id, 1);
             elseif ($command == '/testcsv') test_csv($chat_id);
             elseif ($command == '/checkcsv') {
@@ -900,16 +1760,17 @@ if ($update) {
             }
             elseif ($command == '/start') {
                 $welcome = "🎬 Welcome to Entertainment Tadka!\n\n";
-                $welcome .= "📢 How to use this bot:\n";
+                $welcome .= "🤖 <b>Dual Mode Bot</b>\n\n";
+                $welcome .= "🎥 <b>Movie Search Bot:</b>\n";
                 $welcome .= "• Simply type any movie name\n";
                 $welcome .= "• Use English or Hindi\n";
                 $welcome .= "• Partial names also work\n\n";
+                $welcome .= "📁 <b>File Upload Bot:</b>\n";
+                $welcome .= "• Use /upload_help for file upload features\n";
+                $welcome .= "• Rename, 4GB split, high quality thumbnails\n";
+                $welcome .= "• Metadata & custom thumbnails\n\n";
                 $welcome .= "🔍 Examples:\n";
-                $welcome .= "• kgf\n• pushpa\n• avengers\n• hindi movie\n• spider-man\n\n";
-                $welcome .= "❌ Don't type:\n";
-                $welcome .= "• Technical questions\n";
-                $welcome .= "• Player instructions\n";
-                $welcome .= "• Non-movie queries\n\n";
+                $welcome .= "• kgf\n• pushpa\n• avengers\n• hindi movie\n\n";
                 $welcome .= "📢 Join: @EntertainmentTadka786\n";
                 $welcome .= "💬 Request/Help: @EntertainmentTadka0786";
                 sendMessage($chat_id, $welcome, null, 'HTML');
@@ -917,13 +1778,18 @@ if ($update) {
             }
             elseif ($command == '/stats' && $user_id == OWNER_ID) admin_stats($chat_id);
             elseif ($command == '/help') {
-                $help = "🤖 Entertainment Tadka Bot\n\n📢 Join our channel: @EntertainmentTadka786\n\n📋 Available Commands:\n/start, /checkdate, /totalupload, /testcsv, /checkcsv, /help\n\n🔍 Simply type any movie name to search!";
+                $help = "🤖 Entertainment Tadka Bot\n\n📢 Join our channel: @EntertainmentTadka786\n\n📋 Available Commands:\n/start, /checkdate, /totalupload, /testcsv, /checkcsv, /help\n\n📁 File Upload Commands:\n/upload_help, /setname, /split_on, /metadata, /setthumb\n\n🔍 Simply type any movie name to search!";
                 sendMessage($chat_id, $help, null, 'HTML');
             }
         } else if (!empty(trim($text))) {
             $lang = detect_language($text);
             send_multilingual_response($chat_id, 'searching', $lang);
             advanced_search($chat_id, $text, $user_id);
+        }
+        
+        // Handle file uploads (documents, videos, audio)
+        if (isset($message['document']) || isset($message['video']) || isset($message['audio'])) {
+            handle_file_upload($message);
         }
     }
 
@@ -1061,6 +1927,7 @@ if (!isset($update) || !$update) {
     echo "<li><code>/checkcsv</code> - Check CSV data</li>";
     echo "<li><code>/help</code> - Help message</li>";
     echo "<li><code>/stats</code> - Admin statistics</li>";
+    echo "<li><code>/upload_help</code> - File upload features</li>";
     echo "</ul>";
 }
 ?>
