@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: telegram-bot
+    env: docker
+    plan: free
+    branch: main
+    envVars:
+      - key: BOT_TOKEN
+        value: 8315381064:AAGk0FGVGmB8j5SjpBvW3rD3_kQHe_hyOWU
+      - key: CHANNEL_ID
+        value: -1003181705395
+      - key: GROUP_CHANNEL_ID
+        value: -1003083386043
+      - key: BACKUP_CHANNEL_ID
+        value: -1002964109368
+      - key: BOT_ID
+        value: -8315381064
+      - key: OWNER_ID
+        value: 1080317415
+      - key: APP_API_ID
+        value: 21944581
+      - key: APP_API_HASH
+        value: 7b1c174a5cd3466e25a976c39a791737
+      - key: MAINTENANCE_MODE
+        value: false
+      - key: ENVIRONMENT
+        value: production

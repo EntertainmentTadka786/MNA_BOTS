@@ -1,0 +1,25 @@
+# Environment files
+.env
+*.env.backup
+.env.local
+.env.production
+
+# Logs
+*.log
+logs/
+php-errors.log
+
+# Sensitive data
+config/credentials.php
+backups/
+*.bak
+
+# System files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
