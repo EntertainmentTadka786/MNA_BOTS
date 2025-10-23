@@ -590,21 +590,26 @@ function advanced_search($chat_id, $query, $user_id = null) {
 }
 
 // ==============================
-// Admin stats
+// Admin stats - SYNTAX ERROR FIXED
 // ==============================
 function admin_stats($chat_id) {
     $stats = get_stats();
     $users_data = json_decode(file_get_contents(USERS_FILE), true);
     $total_users = count($users_data['users'] ?? []);
+    
     $msg = "📊 Bot Statistics\n\n";
     $msg .= "🎬 Total Movies: " . ($stats['total_movies'] ?? 0) . "\n";
     $msg .= "👥 Total Users: " . $total_users . "\n";
-    $msg .= "🔍 Total Searches: " . ($stats['total_searches'
-        $msg .= "🕒 Last Updated: " . ($stats['last_updated'] ?? 'N/A') . "\n\n";
+    $msg .= "🔍 Total Searches: " . ($stats['total_searches'] ?? 0) . "\n";
+    $msg .= "🕒 Last Updated: " . ($stats['last_updated'] ?? 'N/A') . "\n\n";
+    
     $csv_data = load_and_clean_csv();
     $recent = array_slice($csv_data, -5);
     $msg .= "📈 Recent Uploads:\n";
-    foreach ($recent as $r) $msg .= "• " . $r['movie_name'] . " (" . $r['date'] . ")\n";
+    foreach ($recent as $r) {
+        $msg .= "• " . $r['movie_name'] . " (" . $r['date'] . ")\n";
+    }
+    
     sendMessage($chat_id, $msg, null, 'HTML');
 }
 
