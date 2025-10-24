@@ -49,3 +49,4 @@ class Config {
 
 // Auto-load config
 Config::loadEnv();
+?>
