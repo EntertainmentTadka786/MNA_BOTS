@@ -758,7 +758,7 @@ function append_movie($movie_name, $message_id_raw, $date = null, $video_path = 
             foreach ($users as $user_data) {
                 list($user_chat_id, $user_id) = $user_data;
                 deliver_item_to_chat($user_chat_id, $item);
-                sendMessage($user_chat_id, "✅ '$query' ab channel me add ho gaya!");
+                sendMessage($user_chat_id, "✅ '$query' ab channel me add ho gaya!\n\n📢 Join: @EntertainmentTadka786\n💬 Help: @EntertainmentTadka7860");
             }
             unset($waiting_users[$query]);
         }
@@ -802,13 +802,13 @@ function send_multilingual_response($chat_id, $message_type, $language) {
         'hindi'=>[
             'welcome' => "🎬 Boss, kis movie ki talash hai?",
             'found' => "✅ Mil gayi! Movie forward ho rahi hai...",
-            'not_found' => "😔 Yeh movie abhi available nahi hai!\n\n📝 Aap ise request kar sakte hain: @EntertainmentTadka0786\n\n🔔 Jab bhi yeh add hogi, main automatically bhej dunga!",
+            'not_found' => "😔 Yeh movie abhi available nahi hai!\n\n📝 Aap ise request kar sakte hain: @EntertainmentTadka7860\n💾 Backups check karo: @ETBackup\n\n🔔 Jab bhi yeh add hogi, main automatically bhej dunga!",
             'searching' => "🔍 Dhoondh raha hoon... Zara wait karo"
         ],
         'english'=>[
             'welcome' => "🎬 Boss, which movie are you looking for?",
             'found' => "✅ Found it! Forwarding the movie...",
-            'not_found' => "😔 This movie isn't available yet!\n\n📝 You can request it here: @EntertainmentTadka0786\n\n🔔 I'll send it automatically once it's added!",
+            'not_found' => "😔 This movie isn't available yet!\n\n📝 You can request it here: @EntertainmentTadka7860\n💾 Check backups: @ETBackup\n\n🔔 I'll send it automatically once it's added!",
             'searching' => "🔍 Searching... Please wait"
         ]
     ];
@@ -871,7 +871,7 @@ function advanced_search($chat_id, $query, $user_id = null) {
         $help_msg .= "• kgf\n• pushpa\n• avengers\n• hindi movie\n• spider-man\n\n";
         $help_msg .= "❌ Technical queries like 'vlc', 'audio track', etc. are not movie names.\n\n";
         $help_msg .= "📢 Join: @EntertainmentTadka786\n";
-        $help_msg .= "💬 Help: @EntertainmentTadka0786";
+        $help_msg .= "💬 Help: @EntertainmentTadka7860";
         sendMessage($chat_id, $help_msg, null, 'HTML');
         return;
     }
@@ -1760,25 +1760,30 @@ if ($update) {
             }
             elseif ($command == '/start') {
                 $welcome = "🎬 Welcome to Entertainment Tadka!\n\n";
-                $welcome .= "🤖 <b>Dual Mode Bot</b>\n\n";
-                $welcome .= "🎥 <b>Movie Search Bot:</b>\n";
+                $welcome .= "📢 How to use this bot:\n";
                 $welcome .= "• Simply type any movie name\n";
                 $welcome .= "• Use English or Hindi\n";
                 $welcome .= "• Partial names also work\n\n";
-                $welcome .= "📁 <b>File Upload Bot:</b>\n";
-                $welcome .= "• Use /upload_help for file upload features\n";
-                $welcome .= "• Rename, 4GB split, high quality thumbnails\n";
-                $welcome .= "• Metadata & custom thumbnails\n\n";
                 $welcome .= "🔍 Examples:\n";
-                $welcome .= "• kgf\n• pushpa\n• avengers\n• hindi movie\n\n";
+                $welcome .= "• kgf\n• pushpa\n• avengers\n• hindi movie\n• spider-man\n\n";
+                $welcome .= "❌ Don't type:\n";
+                $welcome .= "• Technical questions\n";
+                $welcome .= "• Player instructions\n";
+                $welcome .= "• Non-movie queries\n\n";
                 $welcome .= "📢 Join: @EntertainmentTadka786\n";
-                $welcome .= "💬 Request/Help: @EntertainmentTadka0786";
+                $welcome .= "💬 Request/Help: @EntertainmentTadka7860\n";
+                $welcome .= "💾 Backups: @ETBackup";
                 sendMessage($chat_id, $welcome, null, 'HTML');
                 update_user_points($user_id, 'daily_login');
             }
             elseif ($command == '/stats' && $user_id == OWNER_ID) admin_stats($chat_id);
             elseif ($command == '/help') {
-                $help = "🤖 Entertainment Tadka Bot\n\n📢 Join our channel: @EntertainmentTadka786\n\n📋 Available Commands:\n/start, /checkdate, /totalupload, /testcsv, /checkcsv, /help\n\n📁 File Upload Commands:\n/upload_help, /setname, /split_on, /metadata, /setthumb\n\n🔍 Simply type any movie name to search!";
+                $help = "🤖 Entertainment Tadka Bot\n\n";
+                $help .= "📢 Join our channel: @EntertainmentTadka786\n";
+                $help .= "💬 Help & Requests: @EntertainmentTadka7860\n";  
+                $help .= "💾 Backups: @ETBackup\n\n";
+                $help .= "📋 Available Commands:\n/start, /checkdate, /totalupload, /testcsv, /checkcsv, /help\n\n";
+                $help .= "🔍 Simply type any movie name to search!";
                 sendMessage($chat_id, $help, null, 'HTML');
             }
         } else if (!empty(trim($text))) {
@@ -1809,7 +1814,7 @@ if ($update) {
                 usleep(200000);
                 $cnt++;
             }
-            sendMessage($chat_id, "✅ '$data' ke $cnt messages forward/send ho gaye!\n\n📢 Join our channel: @EntertainmentTadka786");
+            sendMessage($chat_id, "✅ '$data' ke $cnt messages forward ho gaye!\n\n📢 Join: @EntertainmentTadka786\n💬 Help: @EntertainmentTadka7860");
             answerCallbackQuery($query['id'], "🎬 $cnt items sent!");
         }
         elseif (strpos($data, 'tu_prev_') === 0) {
@@ -1903,6 +1908,8 @@ if (php_sapi_name() === 'cli' || isset($_GET['setwebhook'])) {
         echo "<p>Name: " . htmlspecialchars($bot_info['result']['first_name']) . "</p>";
         echo "<p>Username: @" . htmlspecialchars($bot_info['result']['username']) . "</p>";
         echo "<p>Channel: @EntertainmentTadka786</p>";
+        echo "<p>Help Group: @EntertainmentTadka7860</p>";
+        echo "<p>Backup Channel: @ETBackup</p>";
     }
     exit;
 }
@@ -1912,6 +1919,8 @@ if (!isset($update) || !$update) {
     $users_data = json_decode(file_get_contents(USERS_FILE), true);
     echo "<h1>🎬 Entertainment Tadka Bot</h1>";
     echo "<p><strong>Telegram Channel:</strong> @EntertainmentTadka786</p>";
+    echo "<p><strong>Help Group:</strong> @EntertainmentTadka7860</p>";
+    echo "<p><strong>Backup Channel:</strong> @ETBackup</p>";
     echo "<p><strong>Status:</strong> ✅ Running</p>";
     echo "<p><strong>Total Movies:</strong> " . ($stats['total_movies'] ?? 0) . "</p>";
     echo "<p><strong>Total Users:</strong> " . count($users_data['users'] ?? []) . "</p>";
