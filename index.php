@@ -25,11 +25,12 @@ define('APP_API_ID', Config::get('APP_API_ID', '21944581'));
 define('APP_API_HASH', Config::get('APP_API_HASH', '7b1c174a5cd3466e25a976c39a791737'));
 define('MAINTENANCE_MODE', Config::get('MAINTENANCE_MODE', 'false') === 'true');
 
-define('CSV_FILE_1', Config::get('CSV_FILE_1', 'movies_channel1.csv'));
-define('CSV_FILE_2', Config::get('CSV_FILE_2', 'movies_channel2.csv'));
-define('CSV_FILE_3', Config::get('CSV_FILE_3', 'movies_channel3.csv'));
-define('PRIVATE_CSV', Config::get('PRIVATE_CSV', 'movies_private.csv'));
-define('COMBINED_CSV', Config::get('COMBINED_CSV', 'movies_combined.csv'));
+// -------------------- MULTI-CHANNEL CSV CONFIG --------------------
+define('CSV_FILE_1', 'entertainment_movies.csv');      // Main Channel - EntertainmentTadka786
+define('CSV_FILE_2', 'backup_movies.csv');             // Backup Channel - ETBackup  
+define('CSV_FILE_3', 'theater_movies.csv');            // Theater Prints Channel
+define('PRIVATE_CSV', 'private_movies.csv');           // Private Channel
+define('COMBINED_CSV', 'all_movies.csv');              // All channels combined database
 define('USERS_FILE', Config::get('USERS_FILE', 'users.json'));
 define('STATS_FILE', Config::get('STATS_FILE', 'bot_stats.json'));
 define('BACKUP_DIR', Config::get('BACKUP_DIR', 'backups/'));
