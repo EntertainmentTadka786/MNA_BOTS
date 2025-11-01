@@ -26,6 +26,7 @@ define('MAINTENANCE_MODE', Config::get('MAINTENANCE_MODE', 'false') === 'true');
 
 // -------------------- DATABASE CONFIG --------------------
 define('DB_FILE', 'movies.db');
+define('DB_BACKUP_DIR', 'db_backups/');
 define('CACHE_DIR', 'cache/');
 define('CACHE_TTL', 300); // 5 minutes
 
@@ -46,7 +47,6 @@ define('DOWNLOAD_STATS', 'download_stats.json');
 define('MOVIE_REQUESTS', 'movie_requests.json');
 define('USER_PREFERENCES', 'user_preferences.json');
 define('RATE_LIMIT_FILE', 'rate_limits.json');
-// -------------------------------------------------------
 
 // ==============================
 // FILE UPLOAD BOT CONFIGURATION
@@ -89,77 +89,747 @@ $user_requests = [];
 $user_last_request = [];
 
 // ==============================
-// DATABASE INITIALIZATION
+// COMPLETE DATABASE INITIALIZATION
 // ==============================
 function init_database() {
-    if (!file_exists(DB_FILE)) {
+    try {
         $db = new SQLite3(DB_FILE);
-        $db->exec("CREATE TABLE movies (
+        $db->enableExceptions(true);
+        
+        // Main movies table
+        $db->exec("CREATE TABLE IF NOT EXISTS movies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             movie_name TEXT NOT NULL,
             message_id INTEGER NOT NULL,
             date TEXT NOT NULL,
             channel_id TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            file_type TEXT DEFAULT 'video',
+            file_size INTEGER DEFAULT 0,
+            quality TEXT DEFAULT 'Unknown',
+            language TEXT DEFAULT 'Hindi',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )");
-        $db->exec("CREATE INDEX idx_movie_name ON movies(movie_name)");
-        $db->exec("CREATE INDEX idx_channel_id ON movies(channel_id)");
-        $db->exec("CREATE INDEX idx_created_at ON movies(created_at)");
+        
+        // Create indexes for faster searches
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_movie_name ON movies(movie_name)");
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_channel_id ON movies(channel_id)");
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_created_at ON movies(created_at)");
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_date ON movies(date)");
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_quality ON movies(quality)");
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_language ON movies(language)");
+        
+        // Users table for better user management
+        $db->exec("CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT NOT NULL,
+            last_name TEXT DEFAULT '',
+            username TEXT DEFAULT '',
+            joined DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
+            points INTEGER DEFAULT 0,
+            search_count INTEGER DEFAULT 0,
+            movies_found INTEGER DEFAULT 0,
+            download_count INTEGER DEFAULT 0,
+            is_premium INTEGER DEFAULT 0,
+            premium_expiry DATETIME DEFAULT NULL
+        )");
+        
+        // User favorites table
+        $db->exec("CREATE TABLE IF NOT EXISTS user_favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            movie_name TEXT NOT NULL,
+            added DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )");
+        
+        // Download history table
+        $db->exec("CREATE TABLE IF NOT EXISTS download_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            movie_name TEXT NOT NULL,
+            movie_id INTEGER,
+            downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE SET NULL
+        )");
+        
+        // Movie requests table
+        $db->exec("CREATE TABLE IF NOT EXISTS movie_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            movie_name TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            request_count INTEGER DEFAULT 1,
+            first_requested DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_requested DATETIME DEFAULT CURRENT_TIMESTAMP,
+            completed_at DATETIME DEFAULT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )");
+        
+        // Bot statistics table
+        $db->exec("CREATE TABLE IF NOT EXISTS bot_statistics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            total_movies INTEGER DEFAULT 0,
+            total_users INTEGER DEFAULT 0,
+            total_searches INTEGER DEFAULT 0,
+            total_downloads INTEGER DEFAULT 0,
+            last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+        )");
+        
+        // Create indexes for new tables
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_favorites_user ON user_favorites(user_id)");
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_downloads_user ON download_history(user_id)");
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_requests_user ON movie_requests(user_id)");
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_requests_status ON movie_requests(status)");
+        
+        // Insert initial statistics record
+        $stmt = $db->prepare("INSERT OR IGNORE INTO bot_statistics (id, total_movies, total_users) VALUES (1, 0, 0)");
+        $stmt->execute();
+        
         $db->close();
+        
+        error_log("✅ Database initialized successfully: " . DB_FILE);
+        return true;
+        
+    } catch (Exception $e) {
+        error_log("❌ Database initialization failed: " . $e->getMessage());
+        return false;
     }
 }
 
-// Initialize database
-init_database();
-
-// File initialization for backward compatibility
-$additional_files = [USERS_FILE, STATS_FILE, FAVORITES_FILE, DOWNLOAD_STATS, MOVIE_REQUESTS, USER_PREFERENCES, RATE_LIMIT_FILE, EXPIRY_TRACKER_FILE];
-foreach ($additional_files as $file) {
-    if (!file_exists($file)) {
-        if ($file === USERS_FILE) {
-            file_put_contents($file, json_encode(['users' => [], 'total_requests' => 0, 'message_logs' => []]));
-        } elseif ($file === STATS_FILE) {
-            file_put_contents($file, json_encode([
-                'total_movies' => 0, 
-                'total_users' => 0, 
-                'total_searches' => 0,
-                'total_downloads' => 0,
-                'last_updated' => date('Y-m-d H:i:s')
-            ]));
-        } else {
-            file_put_contents($file, json_encode([]));
+// ==============================
+// DATABASE BACKUP SYSTEM
+// ==============================
+function backup_database() {
+    try {
+        if (!file_exists(DB_BACKUP_DIR)) {
+            mkdir(DB_BACKUP_DIR, 0755, true);
         }
-        @chmod($file, 0600);
+        
+        $backup_file = DB_BACKUP_DIR . 'movies_backup_' . date('Y-m-d_H-i-s') . '.db';
+        
+        if (copy(DB_FILE, $backup_file)) {
+            // Cleanup old backups (keep only last 7)
+            $backups = glob(DB_BACKUP_DIR . 'movies_backup_*.db');
+            if (count($backups) > 7) {
+                usort($backups, function($a, $b) {
+                    return filemtime($a) - filemtime($b);
+                });
+                
+                $to_delete = array_slice($backups, 0, count($backups) - 7);
+                foreach ($to_delete as $file) {
+                    @unlink($file);
+                }
+            }
+            
+            error_log("✅ Database backup created: " . $backup_file);
+            return $backup_file;
+        }
+        
+    } catch (Exception $e) {
+        error_log("❌ Database backup failed: " . $e->getMessage());
+    }
+    
+    return false;
+}
+
+// ==============================
+// ENHANCED DATABASE FUNCTIONS
+// ==============================
+function add_movie_to_db($movie_name, $message_id, $channel_id, $date = null, $file_type = 'video', $file_size = 0, $quality = 'Unknown', $language = 'Hindi') {
+    if ($date === null) $date = date('d-m-Y');
+    
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("
+            INSERT INTO movies 
+            (movie_name, message_id, date, channel_id, file_type, file_size, quality, language) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ");
+        
+        $stmt->bindValue(1, trim($movie_name), SQLITE3_TEXT);
+        $stmt->bindValue(2, $message_id, SQLITE3_INTEGER);
+        $stmt->bindValue(3, $date, SQLITE3_TEXT);
+        $stmt->bindValue(4, $channel_id, SQLITE3_TEXT);
+        $stmt->bindValue(5, $file_type, SQLITE3_TEXT);
+        $stmt->bindValue(6, $file_size, SQLITE3_INTEGER);
+        $stmt->bindValue(7, $quality, SQLITE3_TEXT);
+        $stmt->bindValue(8, $language, SQLITE3_TEXT);
+        
+        $result = $stmt->execute();
+        $inserted_id = $db->lastInsertRowID();
+        
+        $db->close();
+        
+        // Update statistics
+        update_database_stats('total_movies', 1);
+        
+        // Clear search cache
+        clear_cache('search_');
+        
+        error_log("✅ Movie added to database: {$movie_name} (ID: {$inserted_id})");
+        return $inserted_id;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to add movie to database: " . $e->getMessage());
+        return false;
     }
 }
 
-if (!file_exists(BACKUP_DIR)) {
-    @mkdir(BACKUP_DIR, 0755, true);
+function search_movies_db($query, $limit = 50, $filters = []) {
+    $cache_key = "search_" . md5($query . '_' . $limit . '_' . json_encode($filters));
+    $cached = get_cached_data($cache_key);
+    
+    if ($cached !== null) {
+        return $cached;
+    }
+    
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $sql = "SELECT * FROM movies WHERE movie_name LIKE ?";
+        $params = ["%$query%"];
+        
+        // Add filters if provided
+        if (isset($filters['quality']) && $filters['quality'] !== 'all') {
+            $sql .= " AND quality LIKE ?";
+            $params[] = "%{$filters['quality']}%";
+        }
+        
+        if (isset($filters['language']) && $filters['language'] !== 'all') {
+            $sql .= " AND language LIKE ?";
+            $params[] = "%{$filters['language']}%";
+        }
+        
+        if (isset($filters['channel_id']) && $filters['channel_id'] !== 'all') {
+            $sql .= " AND channel_id = ?";
+            $params[] = $filters['channel_id'];
+        }
+        
+        $sql .= " ORDER BY created_at DESC LIMIT ?";
+        $params[] = $limit;
+        
+        $stmt = $db->prepare($sql);
+        
+        // Bind all parameters
+        foreach ($params as $index => $value) {
+            $stmt->bindValue($index + 1, $value, is_int($value) ? SQLITE3_INTEGER : SQLITE3_TEXT);
+        }
+        
+        $result = $stmt->execute();
+        
+        $movies = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $movies[] = $row;
+        }
+        
+        $db->close();
+        
+        set_cached_data($cache_key, $movies);
+        return $movies;
+        
+    } catch (Exception $e) {
+        error_log("❌ Database search failed: " . $e->getMessage());
+        return [];
+    }
 }
 
-if (!file_exists(CACHE_DIR)) {
-    @mkdir(CACHE_DIR, 0755, true);
+function get_all_movies_db($limit = 1000, $offset = 0) {
+    $cache_key = "all_movies_" . $limit . "_" . $offset;
+    $cached = get_cached_data($cache_key);
+    
+    if ($cached !== null) {
+        return $cached;
+    }
+    
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("SELECT * FROM movies ORDER BY created_at DESC LIMIT ? OFFSET ?");
+        $stmt->bindValue(1, $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $offset, SQLITE3_INTEGER);
+        
+        $result = $stmt->execute();
+        
+        $movies = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $movies[] = $row;
+        }
+        
+        $db->close();
+        
+        set_cached_data($cache_key, $movies);
+        return $movies;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get all movies: " . $e->getMessage());
+        return [];
+    }
 }
 
-// memory caches
-$movie_messages = array();
-$movie_cache = array();
-$waiting_users = array();
+function get_movie_by_id($movie_id) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("SELECT * FROM movies WHERE id = ?");
+        $stmt->bindValue(1, $movie_id, SQLITE3_INTEGER);
+        
+        $result = $stmt->execute();
+        $movie = $result->fetchArray(SQLITE3_ASSOC);
+        
+        $db->close();
+        
+        return $movie;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get movie by ID: " . $e->getMessage());
+        return false;
+    }
+}
 
-// File Upload Bot State
-$file_bot_state = [
-    'metadata' => [],
-    'thumb_mode' => 'preview',
-    'thumb_opacity' => 70,
-    'thumb_textsize' => 18,
-    'thumb_position' => 'top-right',
-    'split' => false,
-    'new_name' => null,
-    'custom_thumb' => null
-];
+function get_movies_by_channel($channel_id, $limit = 100, $offset = 0) {
+    $cache_key = "channel_{$channel_id}_" . $limit . "_" . $offset;
+    $cached = get_cached_data($cache_key);
+    
+    if ($cached !== null) {
+        return $cached;
+    }
+    
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("SELECT * FROM movies WHERE channel_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?");
+        $stmt->bindValue(1, $channel_id, SQLITE3_TEXT);
+        $stmt->bindValue(2, $limit, SQLITE3_INTEGER);
+        $stmt->bindValue(3, $offset, SQLITE3_INTEGER);
+        
+        $result = $stmt->execute();
+        
+        $movies = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $movies[] = $row;
+        }
+        
+        $db->close();
+        
+        set_cached_data($cache_key, $movies);
+        return $movies;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get movies by channel: " . $e->getMessage());
+        return [];
+    }
+}
 
-$file_queue = [];
-$queue_processing = false;
+function get_total_movies_count($filters = []) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $sql = "SELECT COUNT(*) as count FROM movies WHERE 1=1";
+        $params = [];
+        
+        if (isset($filters['channel_id']) && $filters['channel_id'] !== 'all') {
+            $sql .= " AND channel_id = ?";
+            $params[] = $filters['channel_id'];
+        }
+        
+        if (isset($filters['quality']) && $filters['quality'] !== 'all') {
+            $sql .= " AND quality LIKE ?";
+            $params[] = "%{$filters['quality']}%";
+        }
+        
+        if (isset($filters['date']) && $filters['date']) {
+            $sql .= " AND date = ?";
+            $params[] = $filters['date'];
+        }
+        
+        $stmt = $db->prepare($sql);
+        
+        foreach ($params as $index => $value) {
+            $stmt->bindValue($index + 1, $value, SQLITE3_TEXT);
+        }
+        
+        $result = $stmt->execute();
+        $row = $result->fetchArray(SQLITE3_ASSOC);
+        
+        $db->close();
+        
+        return $row['count'] ?? 0;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get movies count: " . $e->getMessage());
+        return 0;
+    }
+}
+
+// ==============================
+// USER MANAGEMENT IN DATABASE
+// ==============================
+function add_user_to_db($user_id, $user_data) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("
+            INSERT OR REPLACE INTO users 
+            (user_id, first_name, last_name, username, joined, last_active, points, search_count, movies_found, download_count) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ");
+        
+        $stmt->bindValue(1, $user_id, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $user_data['first_name'] ?? '', SQLITE3_TEXT);
+        $stmt->bindValue(3, $user_data['last_name'] ?? '', SQLITE3_TEXT);
+        $stmt->bindValue(4, $user_data['username'] ?? '', SQLITE3_TEXT);
+        $stmt->bindValue(5, date('Y-m-d H:i:s'), SQLITE3_TEXT);
+        $stmt->bindValue(6, date('Y-m-d H:i:s'), SQLITE3_TEXT);
+        $stmt->bindValue(7, $user_data['points'] ?? 0, SQLITE3_INTEGER);
+        $stmt->bindValue(8, $user_data['search_count'] ?? 0, SQLITE3_INTEGER);
+        $stmt->bindValue(9, $user_data['movies_found'] ?? 0, SQLITE3_INTEGER);
+        $stmt->bindValue(10, $user_data['download_count'] ?? 0, SQLITE3_INTEGER);
+        
+        $stmt->execute();
+        $db->close();
+        
+        // Update statistics
+        update_database_stats('total_users', 1);
+        
+        return true;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to add user to database: " . $e->getMessage());
+        return false;
+    }
+}
+
+function update_user_activity($user_id) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("UPDATE users SET last_active = ? WHERE user_id = ?");
+        $stmt->bindValue(1, date('Y-m-d H:i:s'), SQLITE3_TEXT);
+        $stmt->bindValue(2, $user_id, SQLITE3_INTEGER);
+        
+        $stmt->execute();
+        $db->close();
+        
+        return true;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to update user activity: " . $e->getMessage());
+        return false;
+    }
+}
+
+function get_user_from_db($user_id) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("SELECT * FROM users WHERE user_id = ?");
+        $stmt->bindValue(1, $user_id, SQLITE3_INTEGER);
+        
+        $result = $stmt->execute();
+        $user = $result->fetchArray(SQLITE3_ASSOC);
+        
+        $db->close();
+        
+        return $user;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get user from database: " . $e->getMessage());
+        return false;
+    }
+}
+
+// ==============================
+// FAVORITES IN DATABASE
+// ==============================
+function add_to_favorites_db($user_id, $movie_name) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        // Check if already in favorites
+        $check_stmt = $db->prepare("SELECT id FROM user_favorites WHERE user_id = ? AND movie_name = ?");
+        $check_stmt->bindValue(1, $user_id, SQLITE3_INTEGER);
+        $check_stmt->bindValue(2, $movie_name, SQLITE3_TEXT);
+        
+        $result = $check_stmt->execute();
+        if ($result->fetchArray()) {
+            $db->close();
+            return false; // Already in favorites
+        }
+        
+        // Add to favorites
+        $stmt = $db->prepare("INSERT INTO user_favorites (user_id, movie_name) VALUES (?, ?)");
+        $stmt->bindValue(1, $user_id, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $movie_name, SQLITE3_TEXT);
+        
+        $stmt->execute();
+        $db->close();
+        
+        return true;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to add to favorites: " . $e->getMessage());
+        return false;
+    }
+}
+
+function get_user_favorites_db($user_id, $limit = 50) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("
+            SELECT uf.*, m.quality, m.language, m.date 
+            FROM user_favorites uf 
+            LEFT JOIN movies m ON uf.movie_name = m.movie_name 
+            WHERE uf.user_id = ? 
+            ORDER BY uf.added DESC 
+            LIMIT ?
+        ");
+        $stmt->bindValue(1, $user_id, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $limit, SQLITE3_INTEGER);
+        
+        $result = $stmt->execute();
+        
+        $favorites = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $favorites[] = $row;
+        }
+        
+        $db->close();
+        
+        return $favorites;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get user favorites: " . $e->getMessage());
+        return [];
+    }
+}
+
+// ==============================
+// DOWNLOAD TRACKING IN DATABASE
+// ==============================
+function track_download_db($user_id, $movie_name, $movie_id = null) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("
+            INSERT INTO download_history (user_id, movie_name, movie_id) 
+            VALUES (?, ?, ?)
+        ");
+        $stmt->bindValue(1, $user_id, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $movie_name, SQLITE3_TEXT);
+        $stmt->bindValue(3, $movie_id, SQLITE3_INTEGER);
+        
+        $stmt->execute();
+        
+        // Update user download count
+        $update_stmt = $db->prepare("UPDATE users SET download_count = download_count + 1 WHERE user_id = ?");
+        $update_stmt->bindValue(1, $user_id, SQLITE3_INTEGER);
+        $update_stmt->execute();
+        
+        // Update global statistics
+        update_database_stats('total_downloads', 1);
+        
+        $db->close();
+        
+        return true;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to track download: " . $e->getMessage());
+        return false;
+    }
+}
+
+function get_download_history_db($user_id, $limit = 20) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("
+            SELECT dh.*, m.quality, m.language 
+            FROM download_history dh 
+            LEFT JOIN movies m ON dh.movie_id = m.id 
+            WHERE dh.user_id = ? 
+            ORDER BY dh.downloaded_at DESC 
+            LIMIT ?
+        ");
+        $stmt->bindValue(1, $user_id, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $limit, SQLITE3_INTEGER);
+        
+        $result = $stmt->execute();
+        
+        $history = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $history[] = $row;
+        }
+        
+        $db->close();
+        
+        return $history;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get download history: " . $e->getMessage());
+        return [];
+    }
+}
+
+// ==============================
+// STATISTICS MANAGEMENT
+// ==============================
+function update_database_stats($field, $increment = 1) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $valid_fields = ['total_movies', 'total_users', 'total_searches', 'total_downloads'];
+        
+        if (in_array($field, $valid_fields)) {
+            $stmt = $db->prepare("UPDATE bot_statistics SET $field = $field + ?, last_updated = ? WHERE id = 1");
+            $stmt->bindValue(1, $increment, SQLITE3_INTEGER);
+            $stmt->bindValue(2, date('Y-m-d H:i:s'), SQLITE3_TEXT);
+            $stmt->execute();
+        }
+        
+        $db->close();
+        return true;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to update statistics: " . $e->getMessage());
+        return false;
+    }
+}
+
+function get_database_stats() {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $result = $db->query("SELECT * FROM bot_statistics WHERE id = 1");
+        $stats = $result->fetchArray(SQLITE3_ASSOC);
+        
+        $db->close();
+        
+        return $stats ?: [
+            'total_movies' => 0,
+            'total_users' => 0,
+            'total_searches' => 0,
+            'total_downloads' => 0,
+            'last_updated' => date('Y-m-d H:i:s')
+        ];
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get database statistics: " . $e->getMessage());
+        return [
+            'total_movies' => 0,
+            'total_users' => 0,
+            'total_searches' => 0,
+            'total_downloads' => 0,
+            'last_updated' => date('Y-m-d H:i:s')
+        ];
+    }
+}
+
+// ==============================
+// DATABASE MAINTENANCE
+// ==============================
+function optimize_database() {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        // Run VACUUM to optimize database
+        $db->exec("VACUUM");
+        
+        // Update statistics
+        $db->exec("ANALYZE");
+        
+        $db->close();
+        
+        error_log("✅ Database optimized successfully");
+        return true;
+        
+    } catch (Exception $e) {
+        error_log("❌ Database optimization failed: " . $e->getMessage());
+        return false;
+    }
+}
+
+function cleanup_old_data($days_old = 30) {
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $cutoff_date = date('Y-m-d H:i:s', strtotime("-$days_old days"));
+        
+        // Cleanup old download history
+        $stmt = $db->prepare("DELETE FROM download_history WHERE downloaded_at < ?");
+        $stmt->bindValue(1, $cutoff_date, SQLITE3_TEXT);
+        $deleted_downloads = $db->changes();
+        $stmt->execute();
+        
+        $db->close();
+        
+        error_log("✅ Cleaned up {$deleted_downloads} old download records");
+        return $deleted_downloads;
+        
+    } catch (Exception $e) {
+        error_log("❌ Data cleanup failed: " . $e->getMessage());
+        return 0;
+    }
+}
+
+// ==============================
+// DATABASE EXPORT FUNCTIONS
+// ==============================
+function export_movies_to_csv($filename = null) {
+    if ($filename === null) {
+        $filename = 'movies_export_' . date('Y-m-d_H-i-s') . '.csv';
+    }
+    
+    try {
+        $movies = get_all_movies_db(10000); // Get all movies
+        
+        $csv_data = "ID,Movie Name,Message ID,Date,Channel ID,Quality,Language,File Type,Created At\n";
+        
+        foreach ($movies as $movie) {
+            $csv_data .= sprintf(
+                "%d,\"%s\",%d,%s,%s,%s,%s,%s,%s\n",
+                $movie['id'],
+                str_replace('"', '""', $movie['movie_name']),
+                $movie['message_id'],
+                $movie['date'],
+                $movie['channel_id'],
+                $movie['quality'],
+                $movie['language'],
+                $movie['file_type'],
+                $movie['created_at']
+            );
+        }
+        
+        file_put_contents($filename, $csv_data);
+        error_log("✅ Movies exported to CSV: {$filename}");
+        return $filename;
+        
+    } catch (Exception $e) {
+        error_log("❌ CSV export failed: " . $e->getMessage());
+        return false;
+    }
+}
 
 // ==============================
 // CACHING SYSTEM
@@ -186,116 +856,6 @@ function clear_cache($pattern = null) {
     foreach ($files as $file) {
         @unlink($file);
     }
-}
-
-// ==============================
-// DATABASE FUNCTIONS
-// ==============================
-function add_movie_to_db($movie_name, $message_id, $channel_id, $date = null) {
-    if ($date === null) $date = date('d-m-Y');
-    
-    $db = new SQLite3(DB_FILE);
-    $stmt = $db->prepare("INSERT INTO movies (movie_name, message_id, date, channel_id) VALUES (?, ?, ?, ?)");
-    $stmt->bindValue(1, $movie_name, SQLITE3_TEXT);
-    $stmt->bindValue(2, $message_id, SQLITE3_INTEGER);
-    $stmt->bindValue(3, $date, SQLITE3_TEXT);
-    $stmt->bindValue(4, $channel_id, SQLITE3_TEXT);
-    $stmt->execute();
-    $db->close();
-    
-    // Clear search cache
-    clear_cache('search_');
-    
-    return true;
-}
-
-function search_movies_db($query, $limit = 50) {
-    $cache_key = "search_" . md5($query . '_' . $limit);
-    $cached = get_cached_data($cache_key);
-    
-    if ($cached !== null) {
-        return $cached;
-    }
-    
-    $db = new SQLite3(DB_FILE);
-    $stmt = $db->prepare("SELECT * FROM movies WHERE movie_name LIKE ? ORDER BY created_at DESC LIMIT ?");
-    $stmt->bindValue(1, "%$query%", SQLITE3_TEXT);
-    $stmt->bindValue(2, $limit, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    
-    $movies = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $movies[] = $row;
-    }
-    $db->close();
-    
-    set_cached_data($cache_key, $movies);
-    return $movies;
-}
-
-function get_all_movies_db($limit = 1000) {
-    $cache_key = "all_movies_" . $limit;
-    $cached = get_cached_data($cache_key);
-    
-    if ($cached !== null) {
-        return $cached;
-    }
-    
-    $db = new SQLite3(DB_FILE);
-    $result = $db->query("SELECT * FROM movies ORDER BY created_at DESC LIMIT $limit");
-    
-    $movies = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $movies[] = $row;
-    }
-    $db->close();
-    
-    set_cached_data($cache_key, $movies);
-    return $movies;
-}
-
-function get_movie_by_id($movie_id) {
-    $db = new SQLite3(DB_FILE);
-    $stmt = $db->prepare("SELECT * FROM movies WHERE id = ?");
-    $stmt->bindValue(1, $movie_id, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    $movie = $result->fetchArray(SQLITE3_ASSOC);
-    $db->close();
-    
-    return $movie;
-}
-
-function get_movies_by_channel($channel_id, $limit = 100) {
-    $cache_key = "channel_{$channel_id}_" . $limit;
-    $cached = get_cached_data($cache_key);
-    
-    if ($cached !== null) {
-        return $cached;
-    }
-    
-    $db = new SQLite3(DB_FILE);
-    $stmt = $db->prepare("SELECT * FROM movies WHERE channel_id = ? ORDER BY created_at DESC LIMIT ?");
-    $stmt->bindValue(1, $channel_id, SQLITE3_TEXT);
-    $stmt->bindValue(2, $limit, SQLITE3_INTEGER);
-    $result = $stmt->execute();
-    
-    $movies = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $movies[] = $row;
-    }
-    $db->close();
-    
-    set_cached_data($cache_key, $movies);
-    return $movies;
-}
-
-function get_total_movies_count() {
-    $db = new SQLite3(DB_FILE);
-    $result = $db->query("SELECT COUNT(*) as count FROM movies");
-    $row = $result->fetchArray(SQLITE3_ASSOC);
-    $db->close();
-    
-    return $row['count'] ?? 0;
 }
 
 // ==============================
@@ -370,15 +930,26 @@ function process_expired_content() {
 }
 
 function remove_movie_from_db($message_id, $channel_id) {
-    $db = new SQLite3(DB_FILE);
-    $stmt = $db->prepare("DELETE FROM movies WHERE message_id = ? AND channel_id = ?");
-    $stmt->bindValue(1, $message_id, SQLITE3_INTEGER);
-    $stmt->bindValue(2, $channel_id, SQLITE3_TEXT);
-    $stmt->execute();
-    $db->close();
-    
-    // Clear cache
-    clear_cache();
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("DELETE FROM movies WHERE message_id = ? AND channel_id = ?");
+        $stmt->bindValue(1, $message_id, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $channel_id, SQLITE3_TEXT);
+        $stmt->execute();
+        
+        $db->close();
+        
+        // Clear cache
+        clear_cache();
+        
+        return true;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to remove movie from database: " . $e->getMessage());
+        return false;
+    }
 }
 
 function check_and_cleanup_expired_content() {
@@ -499,25 +1070,33 @@ function get_rate_limit_message($action) {
 function get_search_suggestions($query) {
     if (strlen($query) < 2) return [];
     
-    $db = new SQLite3(DB_FILE);
-    $stmt = $db->prepare("
-        SELECT movie_name, COUNT(*) as count 
-        FROM movies 
-        WHERE movie_name LIKE ? 
-        GROUP BY movie_name 
-        ORDER BY count DESC, LENGTH(movie_name) ASC 
-        LIMIT 8
-    ");
-    $stmt->bindValue(1, "%$query%", SQLITE3_TEXT);
-    $result = $stmt->execute();
-    
-    $suggestions = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $suggestions[] = $row['movie_name'];
+    try {
+        $db = new SQLite3(DB_FILE);
+        $db->enableExceptions(true);
+        
+        $stmt = $db->prepare("
+            SELECT movie_name, COUNT(*) as count 
+            FROM movies 
+            WHERE movie_name LIKE ? 
+            GROUP BY movie_name 
+            ORDER BY count DESC, LENGTH(movie_name) ASC 
+            LIMIT 8
+        ");
+        $stmt->bindValue(1, "%$query%", SQLITE3_TEXT);
+        $result = $stmt->execute();
+        
+        $suggestions = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $suggestions[] = $row['movie_name'];
+        }
+        $db->close();
+        
+        return $suggestions;
+        
+    } catch (Exception $e) {
+        error_log("❌ Failed to get search suggestions: " . $e->getMessage());
+        return [];
     }
-    $db->close();
-    
-    return $suggestions;
 }
 
 function show_search_suggestions($chat_id, $query) {
@@ -3084,7 +3663,7 @@ function handle_movie_callback($chat_id, $message_id, $movie_name, $user_id) {
                 ]
             ]
         ];
-        
+    
         sendMessage($chat_id, $success_msg, $keyboard, 'HTML');
         update_user_points($user_id, 'found_movie');
         
@@ -3491,6 +4070,82 @@ function is_valid_movie_query($text) {
     
     return false;
 }
+
+// ==============================
+// INITIALIZE DATABASE ON START
+// ==============================
+if (!file_exists(DB_FILE)) {
+    init_database();
+    
+    // Create initial backup
+    backup_database();
+    
+    // Schedule regular maintenance
+    register_shutdown_function(function() {
+        // Run cleanup every 24 hours
+        $last_cleanup = get_user_preference('system', 'last_db_cleanup', 0);
+        if (time() - $last_cleanup > 86400) {
+            cleanup_old_data(30);
+            set_user_preference('system', 'last_db_cleanup', time());
+        }
+        
+        // Run optimization once a week
+        $last_optimize = get_user_preference('system', 'last_db_optimize', 0);
+        if (time() - $last_optimize > 604800) {
+            optimize_database();
+            set_user_preference('system', 'last_db_optimize', time());
+        }
+    });
+}
+
+// File initialization for backward compatibility
+$additional_files = [USERS_FILE, STATS_FILE, FAVORITES_FILE, DOWNLOAD_STATS, MOVIE_REQUESTS, USER_PREFERENCES, RATE_LIMIT_FILE, EXPIRY_TRACKER_FILE];
+foreach ($additional_files as $file) {
+    if (!file_exists($file)) {
+        if ($file === USERS_FILE) {
+            file_put_contents($file, json_encode(['users' => [], 'total_requests' => 0, 'message_logs' => []]));
+        } elseif ($file === STATS_FILE) {
+            file_put_contents($file, json_encode([
+                'total_movies' => 0, 
+                'total_users' => 0, 
+                'total_searches' => 0,
+                'total_downloads' => 0,
+                'last_updated' => date('Y-m-d H:i:s')
+            ]));
+        } else {
+            file_put_contents($file, json_encode([]));
+        }
+        @chmod($file, 0600);
+    }
+}
+
+if (!file_exists(BACKUP_DIR)) {
+    @mkdir(BACKUP_DIR, 0755, true);
+}
+
+if (!file_exists(CACHE_DIR)) {
+    @mkdir(CACHE_DIR, 0755, true);
+}
+
+// Memory caches
+$movie_messages = array();
+$movie_cache = array();
+$waiting_users = array();
+
+// File Upload Bot State
+$file_bot_state = [
+    'metadata' => [],
+    'thumb_mode' => 'preview',
+    'thumb_opacity' => 70,
+    'thumb_textsize' => 18,
+    'thumb_position' => 'top-right',
+    'split' => false,
+    'new_name' => null,
+    'custom_thumb' => null
+];
+
+$file_queue = [];
+$queue_processing = false;
 
 // ==============================
 // Main update processing (webhook)
