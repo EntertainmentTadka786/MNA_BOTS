@@ -25,6 +25,10 @@ define('APP_API_ID', Config::get('APP_API_ID', '21944581'));
 define('APP_API_HASH', Config::get('APP_API_HASH', '7b1c174a5cd3466e25a976c39a791737'));
 define('MAINTENANCE_MODE', Config::get('MAINTENANCE_MODE', 'false') === 'true');
 
+// -------------------- CONTENT EXPIRY CONFIG --------------------
+define('TEMPORARY_CONTENT_EXPIRY', 30 * 60); // 30 minutes in seconds
+define('EXPIRY_TRACKER_FILE', 'content_expiry.json');
+
 // -------------------- MULTI-CHANNEL CSV CONFIG --------------------
 define('CSV_FILE_1', 'entertainment_movies.csv');      // Main Channel - EntertainmentTadka786
 define('CSV_FILE_2', 'backup_movies.csv');             // Backup Channel - ETBackup  
@@ -95,7 +99,7 @@ foreach ($csv_files as $csv_file) {
     }
 }
 
-$additional_files = [USERS_FILE, STATS_FILE, FAVORITES_FILE, DOWNLOAD_STATS, MOVIE_REQUESTS, USER_PREFERENCES, RATE_LIMIT_FILE];
+$additional_files = [USERS_FILE, STATS_FILE, FAVORITES_FILE, DOWNLOAD_STATS, MOVIE_REQUESTS, USER_PREFERENCES, RATE_LIMIT_FILE, EXPIRY_TRACKER_FILE];
 foreach ($additional_files as $file) {
     if (!file_exists($file)) {
         if ($file === USERS_FILE) {
@@ -138,6 +142,164 @@ $file_bot_state = [
 
 $file_queue = [];
 $queue_processing = false;
+
+// ==============================
+// CONTENT EXPIRY SYSTEM
+// ==============================
+function track_temporary_content($message_id, $channel_id, $content_type = 'video') {
+    $expiry_data = json_decode(file_get_contents(EXPIRY_TRACKER_FILE), true) ?? [];
+    
+    $expiry_time = time() + TEMPORARY_CONTENT_EXPIRY;
+    
+    $expiry_data[$message_id] = [
+        'channel_id' => $channel_id,
+        'content_type' => $content_type,
+        'posted_at' => time(),
+        'expires_at' => $expiry_time,
+        'deleted' => false
+    ];
+    
+    file_put_contents(EXPIRY_TRACKER_FILE, json_encode($expiry_data, JSON_PRETTY_PRINT));
+    return $expiry_time;
+}
+
+function generate_expiry_caption($movie_name, $quality, $audio, $subs, $format) {
+    $caption = "✨ " . strtoupper($movie_name) . " ✨\n\n";
+    $caption .= "🎞️ " . $quality . "\n";
+    $caption .= "🔊 " . $audio . "\n";
+    $caption .= "📄 " . $subs . "\n";
+    $caption .= "💿 " . $format . "\n\n";
+    
+    // ⚠️ EXPIRY WARNING
+    $caption .= "⚠️ ⭐ 𝗘𝗻𝘁𝗲𝗿𝘁𝗮𝗶𝗻𝗺𝗲𝗻𝘁𝗧𝗮𝗱𝗸𝗮𝟳𝟴𝟲 𝗔𝗹𝗲𝗿𝘁 ⭐\n\n";
+    $caption .= "Yeh video/file sirf 30 minutes ke liye available hai ⏳\n";
+    $caption .= "Baad mein delete ho jayegi (copyright issue) ❗️\n\n";
+    $caption .= "📥 Jaldi save/forward kar lo — baad mein nahi milegi ❌\n\n";
+    
+    $caption .= "🏆 𝗢𝗳𝗳𝗶𝗰𝗶𝗮𝗹 𝗖𝗵𝗮𝗻𝗻𝗲𝗹𝘀:\n\n";
+    $caption .= "🎯 Main: @𝗘𝗻𝘁𝗲𝗿𝘁𝗮𝗶𝗻𝗺𝗲𝗻𝘁𝗧𝗮𝗱𝗸𝗮𝟳𝟴𝟲\n";
+    $caption .= "📩 Request: @𝗘𝗻𝘁𝗲𝗿𝘁𝗮𝗶𝗻𝗺𝗲𝗻𝘁𝗧𝗮𝗱𝗸𝗮𝟳𝟴𝟲𝟬\n";
+    $caption .= "🛡️ Backup: @𝗘𝗧𝗕𝗮𝗰𝗸𝘂𝗽";
+    
+    return $caption;
+}
+
+function process_expired_content() {
+    $expiry_data = json_decode(file_get_contents(EXPIRY_TRACKER_FILE), true) ?? [];
+    $current_time = time();
+    $deleted_count = 0;
+    
+    foreach ($expiry_data as $message_id => $content) {
+        if (!$content['deleted'] && $current_time >= $content['expires_at']) {
+            try {
+                // Delete the message from channel
+                $result = deleteMessage($content['channel_id'], $message_id);
+                
+                if ($result) {
+                    $expiry_data[$message_id]['deleted'] = true;
+                    $expiry_data[$message_id]['deleted_at'] = $current_time;
+                    $deleted_count++;
+                    
+                    // Also remove from CSV database
+                    remove_movie_from_csv($message_id, $content['channel_id']);
+                }
+            } catch (Exception $e) {
+                // Log deletion errors
+                error_log("Failed to delete message {$message_id}: " . $e->getMessage());
+            }
+        }
+    }
+    
+    file_put_contents(EXPIRY_TRACKER_FILE, json_encode($expiry_data, JSON_PRETTY_PRINT));
+    return $deleted_count;
+}
+
+function remove_movie_from_csv($message_id, $channel_id) {
+    $csv_file = get_channel_csv($channel_id);
+    $temp_file = $csv_file . '.tmp';
+    
+    $read_handle = fopen($csv_file, 'r');
+    $write_handle = fopen($temp_file, 'w');
+    
+    if ($read_handle !== FALSE && $write_handle !== FALSE) {
+        // Copy header
+        $header = fgetcsv($read_handle);
+        fputcsv($write_handle, $header);
+        
+        // Copy all rows except the one with matching message_id
+        while (($row = fgetcsv($read_handle)) !== FALSE) {
+            if (count($row) >= 2 && $row[1] != $message_id) {
+                fputcsv($write_handle, $row);
+            }
+        }
+        
+        fclose($read_handle);
+        fclose($write_handle);
+        
+        // Replace original file
+        rename($temp_file, $csv_file);
+        
+        // Update combined CSV
+        update_combined_csv();
+    }
+}
+
+function check_and_cleanup_expired_content() {
+    $last_cleanup = get_user_preference('system', 'last_cleanup', 0);
+    $current_time = time();
+    
+    // Run cleanup every 5 minutes
+    if ($current_time - $last_cleanup > 300) {
+        $deleted_count = process_expired_content();
+        set_user_preference('system', 'last_cleanup', $current_time);
+        
+        if ($deleted_count > 0) {
+            error_log("Auto-cleanup: Deleted {$deleted_count} expired messages");
+        }
+    }
+}
+
+function show_expiry_stats($chat_id) {
+    if ($chat_id != OWNER_ID) {
+        sendMessage($chat_id, "❌ Access denied. Owner only command.");
+        return;
+    }
+    
+    $expiry_data = json_decode(file_get_contents(EXPIRY_TRACKER_FILE), true) ?? [];
+    $current_time = time();
+    
+    $active_count = 0;
+    $expired_count = 0;
+    $deleted_count = 0;
+    
+    foreach ($expiry_data as $content) {
+        if ($content['deleted']) {
+            $deleted_count++;
+        } elseif ($current_time >= $content['expires_at']) {
+            $expired_count++;
+        } else {
+            $active_count++;
+        }
+    }
+    
+    $message = "⏰ <b>Content Expiry Statistics</b>\n\n";
+    $message .= "🟢 Active: {$active_count} contents\n";
+    $message .= "🟡 Expired (pending delete): {$expired_count}\n";
+    $message .= "🔴 Deleted: {$deleted_count}\n";
+    $message .= "📊 Total Tracked: " . count($expiry_data) . "\n\n";
+    
+    sendMessage($chat_id, $message, null, 'HTML');
+}
+
+function force_cleanup($chat_id) {
+    if ($chat_id != OWNER_ID) {
+        sendMessage($chat_id, "❌ Access denied. Owner only command.");
+        return;
+    }
+    
+    $deleted_count = process_expired_content();
+    sendMessage($chat_id, "🧹 <b>Forced Cleanup Complete</b>\n\nDeleted {$deleted_count} expired messages.");
+}
 
 // ==============================
 // RATE LIMITING SYSTEM
@@ -1876,6 +2038,15 @@ function deleteMessage($chat_id, $message_id) {
     ]);
 }
 
+function editMessageCaption($chat_id, $message_id, $caption, $parse_mode = 'HTML') {
+    return apiRequest('editMessageCaption', [
+        'chat_id' => $chat_id,
+        'message_id' => $message_id,
+        'caption' => $caption,
+        'parse_mode' => $parse_mode
+    ]);
+}
+
 // ==============================
 // Pagination helpers
 // ==============================
@@ -2804,7 +2975,7 @@ function show_csv_data($chat_id, $show_all = false) {
 // Backups & daily digest
 // ==============================
 function auto_backup() {
-    $backup_files = [CSV_FILE_1, CSV_FILE_2, CSV_FILE_3, PRIVATE_CSV, COMBINED_CSV, USERS_FILE, STATS_FILE, FAVORITES_FILE, DOWNLOAD_STATS, MOVIE_REQUESTS, USER_PREFERENCES];
+    $backup_files = [CSV_FILE_1, CSV_FILE_2, CSV_FILE_3, PRIVATE_CSV, COMBINED_CSV, USERS_FILE, STATS_FILE, FAVORITES_FILE, DOWNLOAD_STATS, MOVIE_REQUESTS, USER_PREFERENCES, EXPIRY_TRACKER_FILE];
     $backup_dir = BACKUP_DIR . date('Y-m-d');
     if (!file_exists($backup_dir)) mkdir($backup_dir, 0755, true);
     foreach ($backup_files as $f) if (file_exists($f)) copy($f, $backup_dir . '/' . basename($f) . '.bak');
@@ -3218,9 +3389,9 @@ if ($update) {
             }
 
             if (!empty(trim($text))) {
-                // Auto-generate premium caption agar original caption nahi hai
+                // ✅ YE NAYA CODE - Expiry caption with warning
                 if (empty($message['caption']) && !empty($file_name)) {
-                    $premium_caption = generate_dynamic_premium_caption(
+                    $premium_caption = generate_expiry_caption(
                         pathinfo($file_name, PATHINFO_FILENAME),
                         "1080p HEVC WEB-DL",
                         "Hindi 2.0 + Telugu 5.1",
@@ -3228,9 +3399,12 @@ if ($update) {
                         pathinfo($file_name, PATHINFO_EXTENSION)
                     );
                     
-                    // Edit message with premium caption
+                    // Edit message with premium caption including expiry
                     editMessageCaption($chat_id, $message_id, $premium_caption);
                 }
+                
+                // ✅ YE NAYA CODE - Track for automatic deletion
+                track_temporary_content($message_id, $chat_id, isset($message['video']) ? 'video' : 'document');
                 
                 append_movie_to_channel($text, $message_id, $chat_id, date('d-m-Y'), '');
             }
@@ -3366,6 +3540,13 @@ if ($update) {
             }
             elseif ($command == '/users' && $user_id == OWNER_ID) {
                 show_users_list($chat_id);
+            }
+            // ✅ NEW EXPIRY COMMANDS
+            elseif ($command == '/expirystats' && $user_id == OWNER_ID) {
+                show_expiry_stats($chat_id);
+            }
+            elseif ($command == '/cleanup' && $user_id == OWNER_ID) {
+                force_cleanup($chat_id);
             }
             elseif ($command == '/start') {
                 $welcome = "🎬 <b>Welcome to Entertainment Tadka!</b>\n\n";
@@ -3600,6 +3781,9 @@ if ($update) {
 
     if (date('H:i') == '00:00') auto_backup();
     if (date('H:i') == '08:00') send_daily_digest();
+    
+    // ✅ YE NAYA CODE - Automatic expiry cleanup
+    check_and_cleanup_expired_content();
 }
 
 // Manual save test function
@@ -3689,11 +3873,12 @@ if (!isset($update) || !$update) {
     echo "<li>✅ Multi-Channel Support</li>";
     echo "<li>✅ Premium Captions & UI</li>";
     echo "<li>✅ File Upload Bot</li>";
+    echo "<li>✅ 30-Minute Content Expiry System</li>";
     echo "</ul>";
     
     echo "<h3>📋 COMPLETE COMMANDS LIST</h3>";
     echo "<p><strong>User Commands:</strong> /start, /help, /profile, /mystats, /leaderboard, /favorites, /myhistory, /popular, /recent, /random, /search, /request, /requests, /settings, /notifications, /digest, /channels, /channelstats, /checkdate, /totalupload</p>";
-    echo "<p><strong>Admin Commands:</strong> /stats, /broadcast, /backup, /users</p>";
+    echo "<p><strong>Admin Commands:</strong> /stats, /broadcast, /backup, /users, /expirystats, /cleanup</p>";
     
     echo "<h3>🔧 Quick Setup</h3>";
     echo "<p><a href='?setwebhook=1'>Set Webhook Now</a></p>";
