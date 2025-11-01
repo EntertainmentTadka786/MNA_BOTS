@@ -3421,18 +3421,68 @@ function smart_search($query) {
     global $movie_messages;
     $query_lower = strtolower(trim($query));
     $results = array();
+    
     foreach ($movie_messages as $movie => $entries) {
         $score = 0;
-        if ($movie == $query_lower) $score = 100;
-        elseif (strpos($movie, $query_lower) !== false) $score = 80 - (strlen($movie) - strlen($query_lower));
+        
+        // 1. EXACT MATCH - Highest priority
+        if ($movie == $query_lower) {
+            $score = 100;
+        }
+        // 2. PARTIAL MATCH - Improved logic
+        elseif (strpos($movie, $query_lower) !== false) {
+            $score = 90 - (strlen($movie) - strlen($query_lower));
+        }
+        // 3. KEYWORD MATCH - NEW: Check if main keywords match
+        elseif (keyword_match($movie, $query_lower)) {
+            $score = 80;
+        }
+        // 4. SIMILARITY MATCH - For typos
         else {
             similar_text($movie, $query_lower, $similarity);
-            if ($similarity > 60) $score = $similarity;
+            if ($similarity > 70) {
+                $score = $similarity;
+            }
         }
-        if ($score > 0) $results[$movie] = ['score'=>$score,'count'=>count($entries)];
+        
+        if ($score > 0) {
+            $results[$movie] = ['score' => $score, 'count' => count($entries)];
+        }
     }
-    uasort($results, function($a,$b){return $b['score'] - $a['score'];});
-    return array_slice($results,0,10);
+    
+    uasort($results, function($a, $b) {
+        return $b['score'] - $a['score'];
+    });
+    
+    return array_slice($results, 0, 10);
+}
+
+// NEW FUNCTION: Keyword matching
+function keyword_match($movie_name, $search_query) {
+    $movie_words = explode(' ', strtolower($movie_name));
+    $search_words = explode(' ', $search_query);
+    
+    // Remove common words that don't help in matching
+    $common_words = ['the', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'a', 'an'];
+    $search_words = array_diff($search_words, $common_words);
+    $movie_words = array_diff($movie_words, $common_words);
+    
+    if (empty($search_words)) return false;
+    
+    $match_count = 0;
+    foreach ($search_words as $word) {
+        if (strlen($word) > 2) { // Only words longer than 2 characters
+            foreach ($movie_words as $mword) {
+                if (strpos($mword, $word) !== false || strpos($word, $mword) !== false) {
+                    $match_count++;
+                    break;
+                }
+            }
+        }
+    }
+    
+    // If more than 40% keywords match
+    return ($match_count / count($search_words)) >= 0.4;
 }
 
 function detect_language($text) {
@@ -4802,4 +4852,25 @@ if (!isset($update) || !$update) {
     echo "<p><a href='?test_save=1'>Test Movie Save</a></p>";
     echo "<p><a href='?check_db=1'>Check Database</a></p>";
 }
+// ==============================
+// MANUAL SEARCH ALIASES - QUICK FIX
+// ==============================
+function add_search_aliases() {
+    // Lokah Chapter 1 aliases
+    add_movie_to_db("LOKAH CHAPTER 1", 1000, CHANNEL_1_ID, date('d-m-Y'));
+    add_movie_to_db("Lokah Chapter 1", 1001, CHANNEL_1_ID, date('d-m-Y'));
+    add_movie_to_db("lokah chapter 1", 1002, CHANNEL_1_ID, date('d-m-Y'));
+    add_movie_to_db("Lokah", 1003, CHANNEL_1_ID, date('d-m-Y'));
+    add_movie_to_db("lokah", 1004, CHANNEL_1_ID, date('d-m-Y'));
+    
+    error_log("✅ Search aliases added successfully");
+}
+
+// Temporary alias adder
+if (isset($_GET['add_aliases'])) {
+    add_search_aliases();
+    echo "✅ Search aliases added successfully!<br>";
+    echo "Now test: https://mna-bots.onrender.com?check_db=1";
+    exit;
+}    
 ?>
